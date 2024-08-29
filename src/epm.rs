@@ -33,12 +33,13 @@ use std::{
 
 use codec::{Decode, Encode};
 use frame_election_provider_support::{Get, NposSolution, PhragMMS, SequentialPhragmen};
-use frame_support::{weights::Weight, BoundedVec};
+use frame_support::{traits::IsType, weights::Weight, BoundedVec};
 use pallet_election_provider_multi_phase::{
 	unsigned::TrimmingStatus, RawSolution, ReadySolution, SolutionOf, SolutionOrSnapshotSize,
 };
 use scale_info::{PortableRegistry, TypeInfo};
 use scale_value::scale::decode_as_type;
+use serde::{Deserialize, Serialize};
 use sp_npos_elections::{ElectionScore, VoteWeight};
 use subxt::{dynamic::Value, tx::DynamicPayload};
 
@@ -47,9 +48,42 @@ const EPM_PALLET_NAME: &str = "ElectionProviderMultiPhase";
 type TypeId = u32;
 type MinerVoterOf =
 	frame_election_provider_support::Voter<AccountId, crate::static_types::MaxVotesPerVoter>;
-type RoundSnapshot = pallet_election_provider_multi_phase::RoundSnapshot<AccountId, MinerVoterOf>;
+pub type RoundSnapshot = pallet_election_provider_multi_phase::RoundSnapshot<AccountId, MinerVoterOf>;
 type Voters =
 	Vec<(AccountId, VoteWeight, BoundedVec<AccountId, crate::static_types::MaxVotesPerVoter>)>;
+
+
+fn string_to_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s: String = Deserialize::deserialize(deserializer)?;
+    s.parse::<u64>().map_err(serde::de::Error::custom)
+}
+
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Voter {
+    pub address: AccountId,
+	#[serde(deserialize_with = "string_to_u64")]
+    pub weight: u64,
+    pub targets: Vec<AccountId>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Snapshot {
+    pub targets: Vec<AccountId>,
+    pub voters: Vec<Voter>,
+}
+
+pub(crate) fn load_snapshot(snapshot: Snapshot) -> RoundSnapshot {
+	RoundSnapshot {
+		targets: snapshot.targets,
+		voters: snapshot.voters.iter().map(|v| {
+			(v.address.clone(), v.weight, BoundedVec::try_from(v.targets.clone()).unwrap())
+		}).collect()
+	}
+}
 
 #[derive(Copy, Clone, Debug)]
 struct EpmConstant {
@@ -86,7 +120,7 @@ impl State {
 		self.voters_by_stake.len()
 	}
 
-	fn to_voters(&self) -> Voters {
+	pub fn to_voters(&self) -> Voters {
 		self.voters.clone()
 	}
 }
@@ -340,6 +374,87 @@ where
 		Ok(Ok(s)) => Ok(s),
 		Err(e) => Err(e.into()),
 		Ok(Err(e)) => Err(Error::Other(format!("{:?}", e))),
+	}
+}
+
+pub async fn mine_dry_solution<T>(
+	solver: Solver,
+	snap: Snapshot,
+	desired_targets: u32,
+	round: u32,
+	minimum_untrusted_score: Option<ElectionScore>,
+) -> Result<MinedSolution<T>, Error> 
+where
+	T: MinerConfig<AccountId = AccountId, MaxVotesPerVoter = static_types::MaxVotesPerVoter>
+		+ Send
+		+ Sync
+		+ 'static,
+	T::Solution: Send,
+{
+	let snapshot = load_snapshot(snap);
+	let mut voters = TrimmedVoters::<T>::new(snapshot.voters.clone(), desired_targets).await?;
+
+	let (solution, score, solution_or_snapshot_size, trim_status) = mine_solution::<T>(
+		solver.clone(),
+		snapshot.targets.clone(),
+		voters.to_voters(),
+		desired_targets,
+	)
+	.await?;
+
+	if !trim_status.is_trimmed() {
+		return Ok(MinedSolution {
+			round,
+			desired_targets,
+			snapshot,
+			minimum_untrusted_score,
+			solution,
+			score,
+			solution_or_snapshot_size,
+		});
+	}
+
+	prometheus::on_trim_attempt();
+
+	let mut l = 1;
+	let mut h = voters.len();
+	let mut best_solution = None;
+
+	while l <= h {
+		let mid = ((h - l) / 2) + l;
+
+		let next_state = voters.trim(mid)?;
+
+		let (solution, score, solution_or_snapshot_size, trim_status) = mine_solution::<T>(
+			solver.clone(),
+			snapshot.targets.clone(),
+			next_state.to_voters(),
+			desired_targets,
+		)
+		.await?;
+
+		if !trim_status.is_trimmed() {
+			best_solution = Some((solution, score, solution_or_snapshot_size));
+			h = mid - 1;
+		} else {
+			l = mid + 1;
+		}
+	}
+
+	if let Some((solution, score, solution_or_snapshot_size)) = best_solution {
+		prometheus::on_trim_success();
+
+		Ok(MinedSolution {
+			round,
+			desired_targets,
+			snapshot,
+			minimum_untrusted_score,
+			solution,
+			score,
+			solution_or_snapshot_size,
+		})
+	} else {
+		Err(Error::Feasibility("Failed pre-trim length".to_string()))
 	}
 }
 

@@ -83,6 +83,7 @@ pub enum Command {
 	EmergencySolution(commands::EmergencySolutionConfig),
 	/// Check if the staking-miner metadata is compatible to a remote node.
 	Info,
+	Simulation(commands::SimulationConfig)
 }
 
 // A helper to use different MinerConfig depending on chain.
@@ -136,6 +137,7 @@ async fn main() -> Result<(), Error> {
 			Command::DryRun(cfg) => commands::dry_run_cmd::<MinerConfig>(client, cfg).boxed(),
 			Command::EmergencySolution(cfg) =>
 				commands::emergency_solution_cmd::<MinerConfig>(client, cfg).boxed(),
+			Command::Simulation(cfg) => commands::simulation_cmd::<MinerConfig>(client, cfg).boxed(),
 			Command::Info => async {
 				let is_compat = if runtime::is_codegen_valid_for(&client.chain_api().metadata()) {
 					"YES"
